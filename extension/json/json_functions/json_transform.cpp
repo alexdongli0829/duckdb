@@ -107,14 +107,54 @@ static inline string_t GetString(yyjson_val *val) {
 	return string_t(unsafe_yyjson_get_str(val), unsafe_yyjson_get_len(val));
 }
 
+//! When a column is a wide DECIMAL every number is read as raw text (YYJSON_READ_NUMBER_AS_RAW), so it can be converted
+//! to a DECIMAL without going through a double. Other columns read the number back as the default flags would have:
+//! only an integer that fits no (u)int64 and a number that fits no finite double stay raw (YYJSON_READ_BIGNUM_AS_RAW)
+static inline bool ReadRawNumber(yyjson_val *val, yyjson_val &number) {
+	const auto str = unsafe_yyjson_get_str(val);
+	const auto len = unsafe_yyjson_get_len(val);
+	// fast path for an integer of up to 18 digits, which yyjson reads as a UINT (or a SINT if negative)
+	const bool negative = str[0] == '-';
+	if (len - negative <= 18) {
+		uint64_t value = 0;
+		idx_t pos = negative;
+		while (pos < len && StringUtil::CharacterIsDigit(str[pos])) {
+			value = value * 10 + uint64_t(str[pos] - '0');
+			pos++;
+		}
+		if (pos == len) {
+			if (negative) {
+				unsafe_yyjson_set_sint(&number, -int64_t(value));
+			} else {
+				unsafe_yyjson_set_uint(&number, value);
+			}
+			return true;
+		}
+	}
+	if (!yyjson_read_number(str, &number, YYJSON_READ_ALLOW_INF_AND_NAN, nullptr, nullptr)) {
+		return false;
+	}
+	if (!unsafe_yyjson_is_real(&number)) {
+		return true;
+	}
+	return Value::IsFinite(unsafe_yyjson_get_real(&number)) && strpbrk(str, ".eE");
+}
+
 template <class T, class OP = TryCast>
 static inline bool GetValueNumerical(yyjson_val *val, T &result, JSONTransformOptions &options) {
 	D_ASSERT(unsafe_yyjson_get_tag(val) != (YYJSON_TYPE_NULL | YYJSON_SUBTYPE_NONE));
 	bool success;
 	switch (unsafe_yyjson_get_tag(val)) {
+	case YYJSON_TYPE_RAW | YYJSON_SUBTYPE_NONE: {
+		yyjson_val number;
+		if (ReadRawNumber(val, number)) {
+			return GetValueNumerical<T, OP>(&number, result, options);
+		}
+		success = OP::template Operation<string_t, T>(GetString(val), result, options.strict_cast);
+		break;
+	}
 	case YYJSON_TYPE_STR | YYJSON_SUBTYPE_NOESC:
 	case YYJSON_TYPE_STR | YYJSON_SUBTYPE_NONE:
-	case YYJSON_TYPE_RAW | YYJSON_SUBTYPE_NONE:
 		success = OP::template Operation<string_t, T>(GetString(val), result, options.strict_cast);
 		break;
 	case YYJSON_TYPE_ARR | YYJSON_SUBTYPE_NONE:
@@ -144,14 +184,99 @@ static inline bool GetValueNumerical(yyjson_val *val, T &result, JSONTransformOp
 	return success;
 }
 
+static inline void ComposeDecimalDigits(const uint64_t chunks[], const idx_t chunk_count, const idx_t last_chunk_size,
+                                        int64_t &result) {
+	D_ASSERT(chunk_count == 1);
+	result = static_cast<int64_t>(chunks[0]);
+}
+
+static inline void ComposeDecimalDigits(const uint64_t chunks[], const idx_t chunk_count, const idx_t last_chunk_size,
+                                        hugeint_t &result) {
+	result = hugeint_t(chunks[0]);
+	for (idx_t i = 1; i < chunk_count; i++) {
+		const auto chunk_size = i + 1 == chunk_count ? last_chunk_size : 18;
+		result = result * Hugeint::POWERS_OF_TEN[chunk_size] + hugeint_t(chunks[i]);
+	}
+}
+
+template <class T>
+static inline void ComposeDecimalDigits(const uint64_t chunks[], const idx_t chunk_count, const idx_t last_chunk_size,
+                                        T &result) {
+	int64_t value;
+	ComposeDecimalDigits(chunks, chunk_count, last_chunk_size, value);
+	result = UnsafeNumericCast<T>(value);
+}
+
+//! A raw number is text yyjson validated as -?(0|[1-9][0-9]*)(.[0-9]+)?([eE][+-]?[0-9]+)?. The form without an exponent
+//! is converted here, collecting the digits in 64-bit chunks and rounding on the first digit beyond the scale, as the
+//! string cast does; anything else (an exponent, a value that does not fit) is left to the string cast
+template <class T>
+static bool TryParseRawDecimal(const char *ptr, const idx_t len, T &result, const uint8_t width, const uint8_t scale) {
+	const bool negative = ptr[0] == '-';
+	idx_t int_start = negative;
+	idx_t pos = int_start;
+	while (pos < len && StringUtil::CharacterIsDigit(ptr[pos])) {
+		pos++;
+	}
+	const idx_t int_end = pos;
+	idx_t frac_start = pos;
+	if (pos < len && ptr[pos] == '.') {
+		frac_start = ++pos;
+		while (pos < len && StringUtil::CharacterIsDigit(ptr[pos])) {
+			pos++;
+		}
+	}
+	const idx_t frac_end = pos;
+	if (pos != len) {
+		return false;
+	}
+	if (int_end - int_start == 1 && ptr[int_start] == '0') {
+		int_start = int_end;
+	}
+	if (int_end - int_start > idx_t(width - scale)) {
+		return false;
+	}
+	const idx_t kept_end = MinValue<idx_t>(frac_end, frac_start + scale);
+	uint64_t chunks[3] = {0, 0, 0};
+	idx_t chunk_count = 1;
+	idx_t chunk_size = 0;
+	auto add_digits = [&](idx_t start, idx_t end) {
+		for (idx_t i = start; i < end; i++) {
+			if (chunk_size == 18) {
+				chunk_count++;
+				chunk_size = 0;
+			}
+			chunks[chunk_count - 1] = chunks[chunk_count - 1] * 10 + uint64_t(ptr[i] - '0');
+			chunk_size++;
+		}
+	};
+	add_digits(int_start, int_end);
+	add_digits(frac_start, kept_end);
+	T value;
+	ComposeDecimalDigits(chunks, chunk_count, chunk_size, value);
+	using POWERS = typename DecimalCastTraits<T>::POWERS_OF_TEN_CLASS;
+	value = value * POWERS::POWERS_OF_TEN[scale - (kept_end - frac_start)];
+	if (kept_end < frac_end && ptr[kept_end] >= '5') {
+		value = value + 1;
+	}
+	if (!(value < POWERS::POWERS_OF_TEN[width])) {
+		return false;
+	}
+	result = negative ? -value : value;
+	return true;
+}
+
 template <class T, class OP = TryCastToDecimal>
 static inline bool GetValueDecimal(yyjson_val *val, T &result, uint8_t w, uint8_t s, JSONTransformOptions &options) {
 	D_ASSERT(unsafe_yyjson_get_tag(val) != (YYJSON_TYPE_NULL | YYJSON_SUBTYPE_NONE));
 	bool success;
 	switch (unsafe_yyjson_get_tag(val)) {
+	case YYJSON_TYPE_RAW | YYJSON_SUBTYPE_NONE:
+		success = TryParseRawDecimal<T>(unsafe_yyjson_get_str(val), unsafe_yyjson_get_len(val), result, w, s) ||
+		          OP::template Operation<string_t, T>(GetString(val), result, options.parameters, w, s);
+		break;
 	case YYJSON_TYPE_STR | YYJSON_SUBTYPE_NOESC:
 	case YYJSON_TYPE_STR | YYJSON_SUBTYPE_NONE:
-	case YYJSON_TYPE_RAW | YYJSON_SUBTYPE_NONE:
 		success = OP::template Operation<string_t, T>(GetString(val), result, options.parameters, w, s);
 		break;
 	case YYJSON_TYPE_ARR | YYJSON_SUBTYPE_NONE:
@@ -184,9 +309,16 @@ static inline bool GetValueDecimal(yyjson_val *val, T &result, uint8_t w, uint8_
 static inline bool GetValueString(yyjson_val *val, yyjson_alc *alc, string_t &result, Vector &vector) {
 	D_ASSERT(unsafe_yyjson_get_tag(val) != (YYJSON_TYPE_NULL | YYJSON_SUBTYPE_NONE));
 	switch (unsafe_yyjson_get_tag(val)) {
+	case YYJSON_TYPE_RAW | YYJSON_SUBTYPE_NONE: {
+		yyjson_val number;
+		if (ReadRawNumber(val, number)) {
+			return GetValueString(&number, alc, result, vector);
+		}
+		result = string_t(unsafe_yyjson_get_str(val), unsafe_yyjson_get_len(val));
+		return true;
+	}
 	case YYJSON_TYPE_STR | YYJSON_SUBTYPE_NOESC:
 	case YYJSON_TYPE_STR | YYJSON_SUBTYPE_NONE:
-	case YYJSON_TYPE_RAW | YYJSON_SUBTYPE_NONE:
 		result = string_t(unsafe_yyjson_get_str(val), unsafe_yyjson_get_len(val));
 		return true;
 	case YYJSON_TYPE_ARR | YYJSON_SUBTYPE_NONE:
